@@ -22,7 +22,7 @@ class GPSLayer(nn.Module):
                  pna_degrees=None, equivstable_pe=False, dropout=0.0,
                  attn_dropout=0.0, layer_norm=False, batch_norm=True, g_bn=True,
                  log_attn_weights=False, g_drop=0.0, g_ffn=True,
-                 res_linear=False, residual=False):
+                 res_linear=False, residual=False, task_level=None):
         super().__init__()
 
         self.hid_dim = hid_dim
@@ -37,7 +37,7 @@ class GPSLayer(nn.Module):
         self.g_bn = g_bn
         self.g_drop = g_drop
         self.g_ffn = g_ffn
-        
+        self.task_level = task_level
         if log_attn_weights and global_model_type not in ['Transformer',
                                                           'BiasedTransformer']:
             raise NotImplementedError(
@@ -100,7 +100,9 @@ class GPSLayer(nn.Module):
             self.local_model = GatedGCNLayer(hid_dim, hid_dim,
                                              dropout=g_drop,
                                              residual=residual,
+                                             ffn=g_ffn,
                                              act=act,
+                                             batch_norm=g_bn,
                                              equivstable_pe=equivstable_pe)
         elif local_gnn_type == 'CustomGCNConv':
             self.local_model = GCNConvLayer(hid_dim, hid_dim,
@@ -175,6 +177,8 @@ class GPSLayer(nn.Module):
 
     def forward(self, batch):
         h = batch.x
+        # print(h.device)
+        # assert 0
         # 保存原始节点顺序以便后续恢复
         if self.res_linear:
             # linear residual connection
@@ -186,7 +190,7 @@ class GPSLayer(nn.Module):
         # Local MPNN with edge attributes.
         if self.local_model is not None:
             self.local_model: pygnn.conv.MessagePassing  # Typing hint.
-            if self.local_gnn_type == 'CustomGatedGCN' or 'CustomGINEConv':
+            if self.local_gnn_type == 'CustomGatedGCN' or self.local_gnn_type == 'CustomGINEConv':
                 es_data = None
                 if self.equivstable_pe:
                     es_data = batch.pe_EquivStableLapPE
@@ -228,11 +232,17 @@ class GPSLayer(nn.Module):
         # Multi-head attention.
         if self.self_attn is not None:
             # 保存原始顺序用于后续恢复
-            sorted_idx = batch.batch.sort()[1]
+            # print(f"batch.batch:{batch.batch}")
+            # assert 0
+            if self.task_level == 'node':
+                sorted_idx = torch.arange(batch.num_nodes, device=h.device).sort()[1]
+                h_sorted = h[sorted_idx]
+                batch_sorted = torch.arange(batch.num_nodes, device=sorted_idx.device)[sorted_idx]
+            elif self.task_level == 'edge':
+                sorted_idx = batch.batch.sort()[1]
+                h_sorted = h[sorted_idx]
+                batch_sorted = batch.batch[sorted_idx]
             
-            # 按批次索引对节点排序
-            h_sorted = h[sorted_idx]
-            batch_sorted = batch.batch[sorted_idx]
             
             # 转换为密集批次格式
             h_dense, mask = to_dense_batch(h_sorted, batch_sorted)

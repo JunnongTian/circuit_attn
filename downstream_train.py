@@ -14,7 +14,7 @@ from sampling import dataset_sampling
 # from balanced_mse import GAILoss, BMCLoss, BNILoss, train_gmm, WeightedMSE, get_lds_weights, BalancedSoftmax, FocalLoss, compute_class_weights
 import os
 import matplotlib.pyplot as plt
-
+from torch.optim.lr_scheduler import StepLR
 # from torch.utils.data.sampler import SubsetRandomSampler
 # from sram_dataset import LinkPredictionDataset
 # from sram_dataset import collate_fn, adaption_for_sgrl
@@ -187,22 +187,22 @@ def eval_epoch(args, loader, model, device,
                                 )
     return logger.write_epoch(split)
 
-def regress_train(args, regressor, optimizier, criterion,
+def regress_train(args, regressor, optimizer, criterion,
           train_loader, val_loader, test_loaders, max_label,
-          device):
+          device, scheduler=None):
     """
     Train the head model for regression task
     Args:
         args (argparse.Namespace): The arguments
         regressor (torch.nn.Module): The regressor
-        optimizier (torch.optim.Optimizer): The optimizer
+        optimizer (torch.optim.Optimizer): The optimizer
         criterion (torch.nn.Module): The loss function
         train_loader (torch.utils.data.DataLoader): The training data loader
         val_loader (torch.utils.data.DataLoader): The validation data loader  
         test_laders (list): A list of test data loaders
         device (torch.device): The device to train the model on
     """
-    optimizier.zero_grad()
+    optimizer.zero_grad()
     
     best_results = {
         'best_val_mse': 1e9, 'best_val_loss': 1e9, 
@@ -214,7 +214,7 @@ def regress_train(args, regressor, optimizier, criterion,
         regressor.train()
 
         for i, batch in enumerate(tqdm(train_loader, desc=f'Epoch:{epoch}')):
-            optimizier.zero_grad()
+            optimizer.zero_grad()
 
             ## Get the prediction from the model
             y_pred,y_class, y = regressor(batch.to(device))
@@ -223,7 +223,7 @@ def regress_train(args, regressor, optimizier, criterion,
             _pred = y_pred.detach().to('cpu', non_blocking=True)
 
             loss.backward()
-            optimizier.step()
+            optimizer.step()
             
             ## Update the logger and print message to the screen
             logger.update_stats(
@@ -238,7 +238,9 @@ def regress_train(args, regressor, optimizier, criterion,
             args, val_loader, 
             regressor, device, split='val', criterion=criterion
         )
-
+        if scheduler is not None:
+            scheduler.step()
+            
         ## update the best results so far
         if best_results['best_val_mse'] > val_res['mse']:
             best_results['best_val_mse'] = val_res['mse']
@@ -268,7 +270,7 @@ def regress_train(args, regressor, optimizier, criterion,
 
 def class_train(args, classifier,optimizer_classifier, 
           train_loader, val_loader, test_loaders, max_label,
-          device):
+          device, scheduler=None):
     """
     Train model for capacitance classification task
     Args:
@@ -356,7 +358,10 @@ def class_train(args, classifier,optimizer_classifier,
             classifier, device, split='val', criterion=criterion
         )
         #visualize_tsne(classifier, val_loader, device, num_samples=2000)
-
+        
+        if scheduler is not None:
+            scheduler.step()
+            
         ## ========== testing on other datasets ========== ##
         test_class_results = {}           
         eval_flag = False
@@ -434,19 +439,28 @@ def downstream_train(args, dataset, device, cl_embeds=None):
         start = time.time()
         model = GraphHead(args)
         model = model.to(device)
-        optimizier = torch.optim.Adam(model.parameters(),lr=args.lr)
+        optimizer = torch.optim.Adam(model.parameters(),lr=args.lr)
         
-        regress_train(args, model, optimizier, criterion,
-              train_loader, val_loader, test_loaders, max_label,
-              device)
+        # 1) 每过 30 个 epoch，把 lr 降为原来的一半
+        
+        scheduler = StepLR(optimizer, step_size=40, gamma=0.5)
+        # 或者，用监控 val loss 的方式：
+        # scheduler = ReduceLROnPlateau(optimizer, mode='min',
+        #                               factor=0.5, patience=5,
+        #                               min_lr=1e-6, verbose=True)
+
+        regress_train(args, model, optimizer, criterion,
+                      train_loader, val_loader, test_loaders, max_label,
+                      device, scheduler=scheduler)
         
     elif args.task == 'classification':
         model = GraphHead(args)
         start = time.time()
         model = model.to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+        scheduler = StepLR(optimizer, step_size=40, gamma=0.5)
         class_train(args, model, optimizer, train_loader, val_loader, test_loaders, max_label,
-              device)
+                    device, scheduler=scheduler)
     
     else:
         raise ValueError(f"Task type {args.task} not supported!")
